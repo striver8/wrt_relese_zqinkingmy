@@ -3,9 +3,14 @@
 
 fix_default_set() {
     # 替换默认主题依赖，并注入系统设置和目标平台通用补丁。
-    if [ -d "$BUILD_DIR/feeds/luci/collections/" ]; then
+    if [ -d "$BUILD_DIR/feeds/luci/themes/luci-theme-$THEME_SET" ]; then
         find "$BUILD_DIR/feeds/luci/collections/" -type f -name "Makefile" -exec sed -i "s/luci-theme-bootstrap/luci-theme-$THEME_SET/g" {} \;
+    else
+        echo "警告：luci-theme-$THEME_SET 不在 feed 中，保留 luci-theme-bootstrap 作为兜底主题。" >&2
     fi
+
+    # 兜底：每次开机校验 luci.main.mediaurlbase，避免 sysupgrade 保留配置后指向不存在的主题
+    ensure_luci_theme_guard
 
     install -Dm544 "$BASE_PATH/patches/991_custom_settings" "$BUILD_DIR/package/base-files/files/etc/uci-defaults/991_custom_settings"
     install -Dm544 "$BASE_PATH/patches/992_set-wifi-uci.sh" "$BUILD_DIR/package/base-files/files/etc/uci-defaults/992_set-wifi-uci.sh"

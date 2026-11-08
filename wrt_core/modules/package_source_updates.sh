@@ -263,11 +263,15 @@ update_vantage() {
     commit_hash=$(git -C "$tmp_dir" rev-parse HEAD)
     echo "Vantage 最新提交: $commit_hash"
 
+    # 保留 luci-theme-bootstrap：它是 luci-base 出厂 /etc/config/luci 里
+    # mediaurlbase 的默认值，删干净后 sysupgrade 保留配置升级会导致首页报错。
     if [ -d "$BUILD_DIR/feeds/luci/themes" ]; then
-        find "$BUILD_DIR/feeds/luci/themes" -mindepth 1 -maxdepth 1 ! -name "luci-theme-vantage" -exec rm -rf -- {} +
+        find "$BUILD_DIR/feeds/luci/themes" -mindepth 1 -maxdepth 1 \
+            ! -name "luci-theme-vantage" ! -name "luci-theme-bootstrap" -exec rm -rf -- {} +
     fi
     if [ -d "$BUILD_DIR/package/feeds/luci" ]; then
-        find "$BUILD_DIR/package/feeds/luci" -mindepth 1 -maxdepth 1 -name "luci-theme-*" ! -name "luci-theme-vantage" -exec rm -rf -- {} +
+        find "$BUILD_DIR/package/feeds/luci" -mindepth 1 -maxdepth 1 -name "luci-theme-*" \
+            ! -name "luci-theme-vantage" ! -name "luci-theme-bootstrap" -exec rm -rf -- {} +
     fi
     rm -rf "$dst_theme_path" "$dst_app_path"
     mkdir -p "$BUILD_DIR/feeds/luci/themes" "$BUILD_DIR/feeds/luci/applications"
