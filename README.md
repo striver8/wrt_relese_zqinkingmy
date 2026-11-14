@@ -129,6 +129,8 @@ https://github.com/kenzok8/small-package.git
 
 相关增删和同步逻辑位于 `wrt_core/update.sh` 编排的 `wrt_core/modules/` 静态阶段。配置片段只选择 Kconfig，不负责 clone 仓库、修改 feeds 或安装 feeds。
 
+其中 `wrt_core/modules/package_source_updates.sh` 的 `check_core_libffi` 会在上游源码树缺少 `package/libs/libffi` 时，从 openwrt 主仓库稀疏补全该核心包，用于满足 python3（ctypes 模块）的编译依赖。
+
 ## 8. 项目结构说明
 
 - `build.sh`：主编译入口，负责设备选择、模式选择、配置组合、容器构建和固件收集。
