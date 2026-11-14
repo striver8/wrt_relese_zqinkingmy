@@ -36,3 +36,59 @@ update_nginx_ubus_module() {
         echo "错误：未找到 $makefile_path 文件，无法更新 nginx-mod-ubus 模块。" >&2
     fi
 }
+
+# 兜底主题守卫：每次开机校验 luci.main.mediaurlbase 指向的主题目录与 ucode 模板
+# 是否真的存在，不存在则自动切换到可用主题。
+# 背景：/etc/uci-defaults/30_luci-theme-* 只在首次启动执行一次，sysupgrade
+# 保留配置升级（LuCI 升级页默认勾选）时不会重跑，mediaurlbase 会一直悬空，
+# 表现为首页白屏/无样式并提示 "Error loading theme"。
+ensure_luci_theme_guard() {
+    local init_dst="$BUILD_DIR/package/base-files/files/etc/init.d/luci-theme-guard"
+    local defaults_dst="$BUILD_DIR/package/base-files/files/etc/uci-defaults/993_luci-theme-guard"
+
+    mkdir -p "$(dirname "$init_dst")" "$(dirname "$defaults_dst")"
+
+    cat >"$init_dst" <<'EOS'
+#!/bin/sh /etc/rc.common
+# 保证 luci.main.mediaurlbase 指向实际存在的主题目录与 ucode 模板
+START=19
+STOP=89
+USE_PROCD=0
+
+start() {
+	[ -d /www/luci-static ] || return 0
+
+	cur="$(uci -q get luci.main.mediaurlbase)"
+	name="${cur##*/}"
+
+	if [ -n "$name" ] && [ -d "/www/luci-static/$name" ] && \
+	   [ -d "/usr/share/ucode/luci/template/themes/$name" ]; then
+		return 0
+	fi
+
+	for d in /www/luci-static/*/; do
+		n="${d%/}"; n="${n##*/}"
+		[ "$n" = "resources" ] && continue
+		[ -d "/usr/share/ucode/luci/template/themes/$n" ] || continue
+		uci set "luci.themes.$n=/luci-static/$n"
+		uci set "luci.main.mediaurlbase=/luci-static/$n"
+		uci commit luci
+		rm -rf /tmp/luci-indexcache* /tmp/luci-sessions/*
+		logger -t luci-theme-guard "mediaurlbase 修正为 /luci-static/$n (原: ${cur:-空})"
+		return 0
+	done
+
+	logger -t luci-theme-guard "镜像内没有任何可用主题，LuCI 必然报错"
+}
+EOS
+
+    cat >"$defaults_dst" <<'EOS'
+#!/bin/sh
+# 首次启动同样应用一次主题守卫，不重复实现
+[ -x /etc/init.d/luci-theme-guard ] && /etc/init.d/luci-theme-guard start
+exit 0
+EOS
+
+    chmod 0755 "$init_dst" "$defaults_dst"
+    echo "已注入 /etc/init.d/luci-theme-guard 主题守卫。"
+}
