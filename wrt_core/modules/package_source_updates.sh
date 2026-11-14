@@ -36,6 +36,54 @@ check_default_settings() {
 }
 
 
+check_core_libffi() {
+    # 上游 main 分支删除了 package/libs/libffi，而 python3 3.14 编译 _ctypes
+    # 必须有 libffi 头文件与库；缺失时 configure 会误用宿主机的 libffi.pc，
+    # 导致 "fatal error: ffi.h: No such file or directory"。这里按需补全核心包。
+    local libffi_dir="$BUILD_DIR/package/libs/libffi"
+    local repo_url="https://github.com/openwrt/openwrt.git"
+    local repo_branch="main"
+    local tmp_dir
+
+    if [[ -f "$libffi_dir/Makefile" ]]; then
+        return 0
+    fi
+
+    echo "未找到核心包 libffi（python3 ctypes 依赖），正在从 openwrt 仓库补全..."
+    tmp_dir=$(mktemp -d)
+
+    if ! git_retry clone --depth 1 --filter=blob:none --sparse -b "$repo_branch" "$repo_url" "$tmp_dir"; then
+        echo "错误：克隆 $repo_url 补全 libffi 失败" >&2
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    if ! git_retry -C "$tmp_dir" sparse-checkout set package/libs/libffi; then
+        echo "错误：配置 libffi 稀疏检出失败" >&2
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    if [[ ! -d "$tmp_dir/package/libs/libffi" ]]; then
+        echo "错误：$repo_url $repo_branch 分支缺少 package/libs/libffi" >&2
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$libffi_dir")"
+    \rm -rf "$libffi_dir"
+    mv "$tmp_dir/package/libs/libffi" "$libffi_dir"
+    rm -rf "$tmp_dir"
+
+    if [[ ! -f "$libffi_dir/Makefile" ]]; then
+        echo "错误：libffi 补全后仍未找到 $libffi_dir/Makefile" >&2
+        exit 1
+    fi
+
+    echo "libffi 源码包补全完成。"
+}
+
+
 add_ax6600_led() {
     local athena_led_dir="$BUILD_DIR/package/emortal/luci-app-athena-led"
     local repo_url="https://github.com/NONGFAH/luci-app-athena-led.git"
