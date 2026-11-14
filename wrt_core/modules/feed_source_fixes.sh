@@ -64,38 +64,104 @@ update_homeproxy() {
     fi
 }
 
+file_sha256_hex() {
+    # sha256sum 在含特殊字符的路径下会给输出加反斜杠前缀（\0 在 sed 替换串里代表整个匹配），
+    # 这里统一清洗成纯小写十六进制，避免污染 Makefile。
+    sha256sum "$1" | awk '{print $1}' | tr -d '\\' | tr 'A-Z' 'a-z'
+}
+
+
 update_singbox() {
+    # 需要锁定的 sing-box 版本；改版本只需改这里。
+    local target_version="1.14.4"
     local target_dir="$(get_custom_feed_worktree_dir)/sing-box"
+    local tarball_name="sing-box-${target_version}.tar.gz"
+    local dl_dir="$BUILD_DIR/dl"
+    local tarball_urls=(
+        "https://codeload.github.com/SagerNet/sing-box/tar.gz/v${target_version}"
+        "https://github.com/SagerNet/sing-box/archive/refs/tags/v${target_version}.tar.gz"
+        "https://ghproxy.net/https://github.com/SagerNet/sing-box/archive/refs/tags/v${target_version}.tar.gz"
+    )
+    local mk_path
+    local version_var=""
+    local tmp_tarball
+    local pkg_hash=""
+    local url
+
     # 容错：如果 feeds 体系尚未完全展开，尝试去本地源源目录寻找
     if [ ! -d "$target_dir" ]; then
         target_dir="$(get_custom_feed_source_dir)/sing-box"
     fi
 
-    if [ -d "$target_dir" ]; then
-        echo "正在将 sing-box 锁定编译为 1.14.4 版本..."
-        local mk_path="$target_dir/Makefile"
-        if [ -f "$mk_path" ]; then
-            # 1. 强行修改 Makefile 中的版本号
-            sed -i 's/^PKG_VERSION:=.*/PKG_VERSION:=1.14.4/g' "$mk_path"
-            
-            # 2. 动态获取并更新 sing-box 1.14.4 官方源码的 SHA256 哈希值（防止 OpenWrt 报错）
-            echo "正在获取 sing-box v1.14.14 源码校验和..."
-            local openwrt_tarball_url="https://codeload.github.com/SagerNet/sing-box/tar.gz/v1.14.4"
-            local pkg_hash
-            pkg_hash=$(curl -fsSL "$openwrt_tarball_url" | sha256sum | cut -d' ' -f1)
-            
-            if [ -n "$pkg_hash" ]; then
-                sed -i "s/^PKG_HASH:=.*/PKG_HASH:=$pkg_hash/g" "$mk_path"
-                echo "sing-box 已成功锁定至 1.14.4，哈希值为: $pkg_hash"
-            else
-                # 如果网络波动获取失败，退化为 skip 跳过哈希校验（部分 OpenWrt 固件支持）
-                echo "警告：未能获取 sing-box 源码哈希，尝试使用 skip 绕过" >&2
-                sed -i "s/^PKG_HASH:=.*/PKG_HASH:=skip/g" "$mk_path"
-            fi
-        fi
-    else
+    if [ ! -d "$target_dir" ]; then
         echo "警告：未找到 sing-box 源码目录，跳过版本锁定。" >&2
+        return 0
     fi
+
+    mk_path="$target_dir/Makefile"
+    if [ ! -f "$mk_path" ]; then
+        echo "警告：sing-box Makefile 不存在：$mk_path，跳过版本锁定。" >&2
+        return 0
+    fi
+
+    # 上游在不同时期用 PKG_UPSTREAM_VERSION / PKG_VERSION 承载版本号。
+    # 新版 Makefile 里 PKG_VERSION 由 PKG_UPSTREAM_VERSION 派生（含 $(subst ...)），
+    # 只改写字面量版本行，否则会把派生表达式替换成固定值，导致
+    # PKG_SOURCE 与 PKG_HASH 指向不同版本而下载 404。
+    if grep -qE '^PKG_UPSTREAM_VERSION:=[0-9]' "$mk_path"; then
+        version_var="PKG_UPSTREAM_VERSION"
+    elif grep -qE '^PKG_VERSION:=[0-9]' "$mk_path"; then
+        version_var="PKG_VERSION"
+    fi
+
+    if [ -z "$version_var" ]; then
+        echo "警告：$mk_path 中未找到可改写的版本变量，跳过版本锁定。" >&2
+        return 0
+    fi
+
+    echo "正在将 sing-box 锁定编译为 ${target_version} 版本..."
+
+    # 1. 先把源码包落地到 dl/，build 阶段直接命中本地缓存，
+    #    不再依赖 codeload 在构建时的可用性（历史构建多次在此 404）。
+    mkdir -p "$dl_dir"
+    if [ -f "$dl_dir/$tarball_name" ]; then
+        pkg_hash=$(file_sha256_hex "$dl_dir/$tarball_name")
+        echo "dl 目录已有 $tarball_name，直接复用。"
+    else
+        tmp_tarball=$(mktemp)
+        for url in "${tarball_urls[@]}"; do
+            echo "正在下载 sing-box v${target_version} 源码包：$url"
+            if curl -fsSL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 5 \
+                -o "$tmp_tarball" "$url"; then
+                pkg_hash=$(file_sha256_hex "$tmp_tarball")
+                mv "$tmp_tarball" "$dl_dir/$tarball_name"
+                break
+            fi
+            echo "下载失败，尝试下一个镜像。" >&2
+        done
+        rm -f "$tmp_tarball"
+    fi
+
+    if [ -z "$pkg_hash" ]; then
+        echo "警告：sing-box v${target_version} 源码包获取失败，保持上游版本与校验值不变。" >&2
+        return 0
+    fi
+
+    if ! [[ $pkg_hash =~ ^[0-9a-f]{64}$ ]]; then
+        echo "错误：sing-box v${target_version} 校验值异常（$pkg_hash），保持上游版本与校验值不变。" >&2
+        return 1
+    fi
+
+    # 2. 版本号与校验值同时改写，保证 PKG_SOURCE、PKG_BUILD_DIR、PKG_HASH 三者一致。
+    sed -i "s|^${version_var}:=.*|${version_var}:=${target_version}|" "$mk_path"
+    sed -i "s|^PKG_HASH:=.*|PKG_HASH:=${pkg_hash}|" "$mk_path"
+
+    if ! grep -qE "^${version_var}:=${target_version}$" "$mk_path"; then
+        echo "错误：未能改写 $mk_path 的 ${version_var}，sing-box 版本锁定失败。" >&2
+        exit 1
+    fi
+
+    echo "sing-box 已锁定至 ${target_version}，源码包已就绪：$dl_dir/$tarball_name"
 }
 
 update_lucky() {
