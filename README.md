@@ -131,6 +131,10 @@ https://github.com/kenzok8/small-package.git
 
 其中 `wrt_core/modules/package_source_updates.sh` 的 `check_core_libffi` 会在上游源码树缺少 `package/libs/libffi` 时，从 openwrt 主仓库稀疏补全该核心包，用于满足 python3（ctypes 模块）的编译依赖。
 
+`wrt_core/modules/feed_source_fixes.sh` 的 `update_singbox` 会把 sing-box 锁定到固定版本（默认 `1.14.4`，改版本只需改函数里的 `target_version`），并同步改写 Makefile 中的版本变量与 `PKG_HASH`；同时把源码包预取到 `dl/`，避免构建阶段再访问 codeload 造成下载失败。上游 Makefile 目前用 `PKG_UPSTREAM_VERSION` 承载版本号、`PKG_VERSION` 由它派生，因此脚本只改写“字面量”版本行，不会破坏派生表达式。
+
+同文件的 `fix_libxcrypt_werror` 会在 `feeds/packages/libs/libxcrypt` 存在时为其追加 `CONFIGURE_ARGS += --disable-werror`。openwrt-24.10 分支的 libxcrypt 4.4.36 默认把告警当错误，与 musl 的 fortify 头冲突，编译 `lib/gen-des-tables.c` 会报 `-Werror=format-nonliteral` 而中断；shadow 依赖 libxcrypt，因此形如 `supergateway_s20m_immwrt` 这类会选中 shadow 的设备必须打这个补丁。
+
 ## 8. 项目结构说明
 
 - `build.sh`：主编译入口，负责设备选择、模式选择、配置组合、容器构建和固件收集。
