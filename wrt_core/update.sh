@@ -113,6 +113,7 @@ stage_pre_install_source_fixes() {
     check_default_settings
     check_core_libffi
     fix_libxcrypt_werror
+    fix_containerd_cpuid_linkname
     install_opkg_distfeeds
     fix_easytier_mk
     remove_attendedsysupgrade
