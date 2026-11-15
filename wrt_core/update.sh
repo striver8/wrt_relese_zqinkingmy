@@ -112,6 +112,7 @@ stage_pre_install_source_fixes() {
     update_nginx_ubus_module
     check_default_settings
     check_core_libffi
+    fix_libxcrypt_werror
     install_opkg_distfeeds
     fix_easytier_mk
     remove_attendedsysupgrade
