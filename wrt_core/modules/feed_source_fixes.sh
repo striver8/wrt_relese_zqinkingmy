@@ -85,6 +85,106 @@ fix_libxcrypt_werror() {
     done
 }
 
+fix_containerd_cpuid_linkname() {
+    # containerd 1.7.22 的 vendor/github.com/klauspost/cpuid/v2（v2.0.4）用
+    # //go:linkname 引用 runtime.sched_getaffinity 统计 CPU 数，也 linkname 到
+    # internal/cpu.HWCap 读硬件能力位。Go 1.23 起链接器禁止引用 runtime/内部符号，
+    # arm64 目标链接 ctr 时直接失败：
+    #   link: github.com/klauspost/cpuid/v2: invalid reference to runtime.sched_getaffinity
+    #   make[4]: *** [Makefile:257: bin/ctr] Error 1
+    #   ERROR: package/feeds/packages/containerd failed to build.
+    # 上游 cpuid 后续版本已把 getproccount 改成 runtime.NumCPU()。这里在 prepare 之后
+    # 对 vendor 文件做等价替换：去掉 sched_getaffinity 的 linkname 与声明，getproccount
+    # 改用 runtime.NumCPU()；同时去掉 hwcap 的 linkname，让 detectOS 走它自带的
+    # /proc/self/auxv 回退分支（拿到的 HWCAP 值一致）。
+    # 注意：该包自带的 build_dir 会在 configure 阶段被拷进 .go_work/build/src，
+    # 所以钩子必须挂在 Prepare 之后、Configure 之前。
+    local pkg_dirs=(
+        "$BUILD_DIR/feeds/packages/utils/containerd"
+        "$BUILD_DIR/package/feeds/packages/containerd"
+    )
+    local dir
+
+    for dir in "${pkg_dirs[@]}"; do
+        [ -f "$dir/Makefile" ] || continue
+
+        if grep -q "ContainerdPatchCpuidLinkname" "$dir/Makefile"; then
+            continue
+        fi
+
+        mkdir -p "$dir/files"
+        cat >"$dir/files/fix-cpuid-linkname.sh" <<'SCRIPT'
+#!/bin/sh
+# 用法：fix-cpuid-linkname.sh <os_linux_arm64.go>
+# 把 cpuid v2.0.4 里依赖 //go:linkname 引用 runtime 内部符号的实现，换成上游
+# 后续版本的做法（runtime.NumCPU()），规避 Go 1.23+ 链接器的
+# "invalid reference to runtime.sched_getaffinity"。已处理过或文件不存在时直接跳过。
+set -e
+
+f="$1"
+[ -f "$f" ] || exit 0
+grep -q 'go:linkname sched_getaffinity' "$f" || exit 0
+
+tmp="$f.cpuidfix.$$"
+awk '
+{ L[NR] = $0 }
+END {
+	for (i = 1; i <= NR; i++) {
+		if (L[i] == "//go:noescape" && L[i + 1] ~ /^\/\/go:linkname sched_getaffinity/) continue
+		if (L[i] ~ /^\/\/go:linkname sched_getaffinity/) continue
+		if (L[i] ~ /^\/\/go:linkname hwcap /) continue
+		if (L[i] ~ /^func sched_getaffinity\(/) continue
+		if (L[i] ~ /^func getproccount\(\) int32 \{$/) {
+			print "func getproccount() int32 {"
+			print "\treturn int32(runtime.NumCPU())"
+			print "}"
+			skip = 1
+			continue
+		}
+		if (skip) {
+			if (L[i] == "}") skip = 0
+			continue
+		}
+		print L[i]
+	}
+}
+' "$f" >"$tmp"
+
+# 替换后文件里可能不再引用 unsafe，此时删掉该 import，避免 unused import 报错。
+if ! grep -q 'unsafe\.' "$tmp"; then
+	sed -i '/^[[:space:]]*"unsafe"[[:space:]]*$/d' "$tmp"
+fi
+
+mv "$tmp" "$f"
+SCRIPT
+        chmod 0755 "$dir/files/fix-cpuid-linkname.sh"
+
+        # 钩子必须在 $(eval $(call BuildPackage,...)) 之前注册：BuildPackage 展开时
+        # 会把 Hooks/Prepare/Post 就地展开成具体命令，之后再注册就无效了。
+        awk '
+            index($0, "$(eval $(call BuildPackage") == 1 && !inserted {
+                print "# Go 1.23+ 的链接器不允许 cpuid v2.0.4 通过 //go:linkname 引用 runtime"
+                print "# 内部符号（runtime.sched_getaffinity / internal/cpu.HWCap），containerd"
+                print "# 的 ctr 会链接失败；在 prepare 之后、configure 拷贝源码到 .go_work 之前替换。"
+                print "define ContainerdPatchCpuidLinkname"
+                print "sh $(CURDIR)/files/fix-cpuid-linkname.sh \"$(PKG_BUILD_DIR)/vendor/github.com/klauspost/cpuid/v2/os_linux_arm64.go\""
+                print "endef"
+                print "Hooks/Prepare/Post += ContainerdPatchCpuidLinkname"
+                inserted = 1
+            }
+            { print }
+        ' "$dir/Makefile" >"$dir/Makefile.tmp"
+        mv -f "$dir/Makefile.tmp" "$dir/Makefile"
+
+        if ! grep -q "ContainerdPatchCpuidLinkname" "$dir/Makefile"; then
+            echo "警告：未在 $dir/Makefile 中找到 BuildPackage 行，cpuid 补丁钩子未注册。" >&2
+            continue
+        fi
+
+        echo "已为 containerd 打上 cpuid linkname 兼容补丁（Go 1.23+）：$dir/Makefile"
+    done
+}
+
 
 update_homeproxy() {
     local repo_url="https://github.com/xchxtom/luci-app-homeproxy.git"
