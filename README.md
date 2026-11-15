@@ -135,6 +135,8 @@ https://github.com/kenzok8/small-package.git
 
 同文件的 `fix_libxcrypt_werror` 会在 `feeds/packages/libs/libxcrypt` 存在时为其追加 `CONFIGURE_ARGS += --disable-werror`。openwrt-24.10 分支的 libxcrypt 4.4.36 默认把告警当错误，与 musl 的 fortify 头冲突，编译 `lib/gen-des-tables.c` 会报 `-Werror=format-nonliteral` 而中断；shadow 依赖 libxcrypt，因此形如 `supergateway_s20m_immwrt` 这类会选中 shadow 的设备必须打这个补丁。
 
+同文件的 `fix_containerd_cpuid_linkname` 用于 containerd：1.7.22 随源码附带的 `vendor/github.com/klauspost/cpuid/v2`（v2.0.4）通过 `//go:linkname` 引用 `runtime.sched_getaffinity` 与 `internal/cpu.HWCap`，Go 1.23 起链接器不再允许这类引用，arm64 目标编译 `ctr` 会失败并报 `link: github.com/klauspost/cpuid/v2: invalid reference to runtime.sched_getaffinity`。该函数会在包目录写入 `files/fix-cpuid-linkname.sh`，并注册 `Hooks/Prepare/Post` 钩子，在 prepare 之后把 `getproccount` 换成上游后续版本的 `runtime.NumCPU()` 实现（同时让 HWCAP 走 `/proc/self/auxv` 回退）。
+
 ## 8. 项目结构说明
 
 - `build.sh`：主编译入口，负责设备选择、模式选择、配置组合、容器构建和固件收集。
