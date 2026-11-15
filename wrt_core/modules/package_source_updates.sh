@@ -313,14 +313,52 @@ update_vantage() {
 
     # 保留 luci-theme-bootstrap：它是 luci-base 出厂 /etc/config/luci 里
     # mediaurlbase 的默认值，删干净后 sysupgrade 保留配置升级会导致首页报错。
+    #
+    # 另外不能删「仍被其它包依赖」的主题：主题在 themes/ 下、依赖它的应用在
+    # applications/ 下，删主题不删应用会留下悬空依赖，编译期只报
+    # "has a dependency on 'luci-theme-xxx', which does not exist" 警告，
+    # 直到 package/install 阶段才由 opkg 抛
+    # "cannot find dependency ... / Cannot install package ..." 中断整次构建
+    # （典型例子：luci-app-argon-config 依赖 luci-theme-argon）。
+    local keep_themes=("luci-theme-vantage" "luci-theme-bootstrap")
+    local referenced_themes theme_dir theme_name kept referenced
+    referenced_themes=$(grep -rhoE "luci-theme-[A-Za-z0-9_-]+" --include=Makefile \
+        "$BUILD_DIR/feeds/luci/applications" \
+        "$BUILD_DIR/feeds/luci/modules" \
+        "$BUILD_DIR/feeds/luci/collections" 2>/dev/null | sort -u)
+
     if [ -d "$BUILD_DIR/feeds/luci/themes" ]; then
-        find "$BUILD_DIR/feeds/luci/themes" -mindepth 1 -maxdepth 1 \
-            ! -name "luci-theme-vantage" ! -name "luci-theme-bootstrap" -exec rm -rf -- {} +
+        while IFS= read -r -d '' theme_dir; do
+            theme_name=${theme_dir##*/}
+            kept=0
+            for referenced in $referenced_themes; do
+                if [ "$referenced" = "$theme_name" ]; then
+                    kept=1
+                    break
+                fi
+            done
+            if [ "$kept" = "1" ]; then
+                echo "保留主题 $theme_name：仍有包依赖它。"
+                keep_themes+=("$theme_name")
+            fi
+        done < <(find "$BUILD_DIR/feeds/luci/themes" -mindepth 1 -maxdepth 1 -type d -print0)
     fi
-    if [ -d "$BUILD_DIR/package/feeds/luci" ]; then
-        find "$BUILD_DIR/package/feeds/luci" -mindepth 1 -maxdepth 1 -name "luci-theme-*" \
-            ! -name "luci-theme-vantage" ! -name "luci-theme-bootstrap" -exec rm -rf -- {} +
-    fi
+
+    local theme_root
+    for theme_root in "$BUILD_DIR/feeds/luci/themes" "$BUILD_DIR/package/feeds/luci"; do
+        [ -d "$theme_root" ] || continue
+        while IFS= read -r -d '' theme_dir; do
+            theme_name=${theme_dir##*/}
+            kept=0
+            for referenced in "${keep_themes[@]}"; do
+                if [ "$referenced" = "$theme_name" ]; then
+                    kept=1
+                    break
+                fi
+            done
+            [ "$kept" = "1" ] || \rm -rf -- "$theme_dir"
+        done < <(find "$theme_root" -mindepth 1 -maxdepth 1 -name "luci-theme-*" -print0)
+    done
     rm -rf "$dst_theme_path" "$dst_app_path"
     mkdir -p "$BUILD_DIR/feeds/luci/themes" "$BUILD_DIR/feeds/luci/applications"
     mv "$tmp_dir/luci-theme-vantage" "$dst_theme_path"
