@@ -50,6 +50,42 @@ remove_unwanted_packages() {
 }
 
 
+fix_libxcrypt_werror() {
+    # openwrt-24.10 的 feeds/packages/libs/libxcrypt（4.4.36）默认把告警当错误处理，
+    # 与 musl 的 fortify 头冲突：staging 的 include/fortify/stdio.h 用
+    # __builtin_va_arg_pack 包装 snprintf/sprintf，编译 lib/gen-des-tables.c 时
+    # 会报 -Werror=format-nonliteral 并中断，表现为
+    #   make[5]: *** [Makefile:1915: lib/gen-des-tables.o] Error 1
+    # shadow 依赖 libxcrypt，因此选中 shadow 的设备（如 supergateway_s20m_immwrt）会失败。
+    # 该包自带 --disable-werror 开关，打开即可，不影响其它包。
+    local mk_paths=(
+        "$BUILD_DIR/feeds/packages/libs/libxcrypt/Makefile"
+        "$BUILD_DIR/package/feeds/packages/libxcrypt/Makefile"
+    )
+    local mk_path
+
+    for mk_path in "${mk_paths[@]}"; do
+        [ -f "$mk_path" ] || continue
+
+        if grep -q -- "--disable-werror" "$mk_path"; then
+            continue
+        fi
+
+        if ! grep -q "^CONFIGURE_ARGS" "$mk_path"; then
+            continue
+        fi
+
+        # 尽量插在 BuildPackage 之前，保持文件结构可读。
+        sed -i '/^\$(eval \$(call BuildPackage/i CONFIGURE_ARGS += --disable-werror' "$mk_path"
+        if ! grep -q -- "--disable-werror" "$mk_path"; then
+            printf '\nCONFIGURE_ARGS += --disable-werror\n' >>"$mk_path"
+        fi
+
+        echo "已为 libxcrypt 关闭 -Werror（规避 musl fortify 的 -Wformat-nonliteral）：$mk_path"
+    done
+}
+
+
 update_homeproxy() {
     local repo_url="https://github.com/xchxtom/luci-app-homeproxy.git"
     local target_dir="$(get_custom_feed_worktree_dir)/luci-app-homeproxy"
