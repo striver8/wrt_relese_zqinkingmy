@@ -137,6 +137,10 @@ https://github.com/kenzok8/small-package.git
 
 同文件的 `fix_containerd_cpuid_linkname` 用于 containerd：1.7.22 随源码附带的 `vendor/github.com/klauspost/cpuid/v2`（v2.0.4）通过 `//go:linkname` 引用 `runtime.sched_getaffinity` 与 `internal/cpu.HWCap`，Go 1.23 起链接器不再允许这类引用，arm64 目标编译 `ctr` 会失败并报 `link: github.com/klauspost/cpuid/v2: invalid reference to runtime.sched_getaffinity`。该函数会在包目录写入 `files/fix-cpuid-linkname.sh`，并注册 `Hooks/Prepare/Post` 钩子，在 prepare 之后把 `getproccount` 换成上游后续版本的 `runtime.NumCPU()` 实现（同时让 HWCAP 走 `/proc/self/auxv` 回退）。
 
+`wrt_core/modules/package_source_updates.sh` 的 `update_vantage` 会把 LuCI 主题收敛到 `luci-theme-vantage`（外加上游默认的 `luci-theme-bootstrap`）。删除前它会扫描 `feeds/luci` 下所有应用的 Makefile，凡是仍被应用依赖的主题（例如 `luci-app-argon-config` 依赖 `luci-theme-argon`）一律保留：只删主题不删应用会留下悬空依赖，编译期只是 `has a dependency on ..., which does not exist` 警告，直到 `package/install` 阶段才由 opkg 以 `cannot find dependency` 中断整次构建。
+
+`wrt_core/modules/docker.sh` 的 `docker_stack_sync_nftables_compat` 会按 dockerd 版本决定 firewall backend：`firewall-backend` 是 moby 28.0 才有的 `daemon.json` 选项，而 openwrt-24.10 分支的 dockerd 仍是 27.x，写入该字段会让守护进程直接拒绝启动（`the following directives don't match any configuration option: firewall-backend`）。因此 28+ 继续走 nftables backend，27.x 则退回 iptables（由 `iptables-nft` 提供 `iptables` 命令，与 fw4 共存），同时把 `/etc/config/dockerd` 的 `firewall_backend` 写成对应值，并保证 27.x 的 init 脚本里不出现该 json 字段。
+
 ## 8. 项目结构说明
 
 - `build.sh`：主编译入口，负责设备选择、模式选择、配置组合、容器构建和固件收集。
