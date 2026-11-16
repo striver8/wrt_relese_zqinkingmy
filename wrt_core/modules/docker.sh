@@ -62,6 +62,30 @@ _docker_stack_normalize_build_dir() {
     fi
 }
 
+_docker_stack_dockerd_major_version() {
+    # 读取 dockerd Makefile 中的版本主号，读不到则返回失败。
+    local mk_path="$1"
+    local version=""
+
+    [ -f "$mk_path" ] || return 1
+    version=$(sed -n 's/^PKG_VERSION:=\([0-9][0-9.]*\).*/\1/p' "$mk_path" | head -n 1)
+    [ -n "$version" ] || return 1
+
+    printf '%s\n' "${version%%.*}"
+}
+
+_docker_stack_dockerd_supports_firewall_backend() {
+    # firewall-backend 是 moby 28.0 才引入的 daemon.json 选项。27.x 的
+    # daemon/config 会把未注册的指令当错误直接拒绝启动：
+    #   unable to configure the Docker daemon with file /tmp/dockerd/daemon.json:
+    #   the following directives don't match any configuration option: firewall-backend
+    # 因此 27.x 必须退回 iptables（配合 iptables-nft 与 fw4 共存）。
+    local major=""
+
+    major=$(_docker_stack_dockerd_major_version "$1") || return 1
+    [ "$major" -ge 28 ] 2>/dev/null
+}
+
 _docker_stack_set_or_append_dockerd_uci_option() {
     local config_path="$1"
     local option_name="$2"
@@ -203,15 +227,26 @@ _docker_stack_fix_dockerd_vendored_checks() {
 
 _docker_stack_fix_dockerd_nftables_comment() {
     local config_path="$1"
+    local firewall_backend="${2:-nftables}"
 
     if grep -Fq "Docker doesn't work well out of the box with fw4." "$config_path"; then
-        sed -i \
-            -e "/^# Docker doesn't work well out of the box with fw4\./c\# firewall_backend defaults to nftables and is expected to work with fw4." \
-            -e "/^# naively translates iptables rules\. For the best compatibility replace the following dependencies:/c\# If you must use legacy behavior for compatibility, switch \`firewall_backend\` to \`iptables\`." \
-            -e "/^# \`firewall4\` -> \`firewall\`/d" \
-            -e "/^# \`iptables-nft\` -> \`iptables-legacy\`/d" \
-            -e "/^# \`ip6tables-nft\` -> \`ip6tables-legacy\`/d" \
-            "$config_path"
+        if [ "$firewall_backend" = "nftables" ]; then
+            sed -i \
+                -e "/^# Docker doesn't work well out of the box with fw4\./c\# firewall_backend defaults to nftables and is expected to work with fw4." \
+                -e "/^# naively translates iptables rules\. For the best compatibility replace the following dependencies:/c\# If you must use legacy behavior for compatibility, switch \`firewall_backend\` to \`iptables\`." \
+                -e "/^# \`firewall4\` -> \`firewall\`/d" \
+                -e "/^# \`iptables-nft\` -> \`iptables-legacy\`/d" \
+                -e "/^# \`ip6tables-nft\` -> \`ip6tables-legacy\`/d" \
+                "$config_path"
+        else
+            sed -i \
+                -e "/^# Docker doesn't work well out of the box with fw4\./c\# dockerd 27.x has no firewall-backend support, so iptables is used; the iptables command is provided by iptables-nft and works with fw4." \
+                -e "/^# naively translates iptables rules\. For the best compatibility replace the following dependencies:/d" \
+                -e "/^# \`firewall4\` -> \`firewall\`/d" \
+                -e "/^# \`iptables-nft\` -> \`iptables-legacy\`/d" \
+                -e "/^# \`ip6tables-nft\` -> \`ip6tables-legacy\`/d" \
+                "$config_path"
+        fi
     fi
 }
 
@@ -372,6 +407,14 @@ _docker_stack_init_supports_nftables_backend() {
         && grep -Fq 'nft add rule inet "${NFT_DOCKER_USER_TABLE}" "${NFT_DOCKER_USER_CHAIN}" iifname "${inbound}" oifname "${outbound}" reject' "$dockerd_init"
 }
 
+_docker_stack_init_supports_iptables_backend() {
+    # 27.x 分支的补丁形态：有 firewall_backend 读取，但绝不能写 firewall-backend 字段。
+    local dockerd_init="$1"
+
+    grep -Fq 'config_get firewall_backend globals firewall_backend "iptables"' "$dockerd_init" \
+        && ! grep -Fq 'json_add_string "firewall-backend"' "$dockerd_init"
+}
+
 _docker_stack_patch_nft_prereq_block() {
     local dockerd_init="$1"
     local tmp_path=""
@@ -475,17 +518,26 @@ _docker_stack_patch_nft_prereq_block() {
 
 _docker_stack_patch_process_config_nftables() {
     local dockerd_init="$1"
+    local firewall_backend_default="${2:-nftables}"
     local tmp_path=""
+
+    case "$firewall_backend_default" in
+        nftables|iptables) ;;
+        *)
+            echo "错误：不支持的 dockerd firewall backend 默认值: $firewall_backend_default" >&2
+            return 1
+            ;;
+    esac
 
     sed -i 's/^[[:space:]]*local alt_config_file data_root log_level iptables ip6tables bip$/\tlocal alt_config_file data_root log_level firewall_backend iptables ip6tables bip/' "$dockerd_init"
 
-    if ! grep -Fq 'config_get firewall_backend globals firewall_backend "nftables"' "$dockerd_init"; then
+    if ! grep -Fq 'config_get firewall_backend globals firewall_backend' "$dockerd_init"; then
         tmp_path=$(mktemp) || {
             echo "错误：创建临时文件失败" >&2
             return 1
         }
 
-        awk '
+        awk -v def="$firewall_backend_default" '
             BEGIN {
                 replaced = 0
                 skipping = 0
@@ -498,9 +550,9 @@ _docker_stack_patch_process_config_nftables() {
                     print "\tconfig_get data_root globals data_root \"/opt/docker/\""
                     print "\tconfig_get log_level globals log_level \"warn\""
                     print "\tif uci_quiet get dockerd.globals.firewall_backend; then"
-                    print "\t\tconfig_get firewall_backend globals firewall_backend \"nftables\""
+                    print "\t\tconfig_get firewall_backend globals firewall_backend \"" def "\""
                     print "\telse"
-                    print "\t\tfirewall_backend=\"nftables\""
+                    print "\t\tfirewall_backend=\"" def "\""
                     print "\t\tlogger -t \"dockerd-init\" -p notice \"Migrating dockerd firewall backend to ${firewall_backend}\""
                     print "\t\tuci_quiet set dockerd.globals.firewall_backend=\"${firewall_backend}\" && uci_quiet commit dockerd || {"
                     print "\t\t\tlogger -t \"dockerd-init\" -p err \"Failed to persist dockerd firewall backend migration\""
@@ -508,16 +560,27 @@ _docker_stack_patch_process_config_nftables() {
                     print "\t\t}"
                     print "\tfi"
                     print "\tcase \"${firewall_backend}\" in"
-                    print "\t\tiptables|nftables)"
-                    print "\t\t\t;;"
-                    print "\t\t*)"
-                    print "\t\t\tlogger -t \"dockerd-init\" -p notice \"Unsupported dockerd firewall backend ${firewall_backend}, defaulting to nftables\""
-                    print "\t\t\tfirewall_backend=\"nftables\""
-                    print "\t\t\t;;"
+                    if (def == "nftables") {
+                        print "\t\tiptables|nftables)"
+                        print "\t\t\t;;"
+                        print "\t\t*)"
+                        print "\t\t\tlogger -t \"dockerd-init\" -p notice \"Unsupported dockerd firewall backend ${firewall_backend}, defaulting to nftables\""
+                        print "\t\t\tfirewall_backend=\"nftables\""
+                        print "\t\t\t;;"
+                    } else {
+                        print "\t\tiptables)"
+                        print "\t\t\t;;"
+                        print "\t\t*)"
+                        print "\t\t\tlogger -t \"dockerd-init\" -p notice \"Dockerd without firewall-backend support cannot use ${firewall_backend}, falling back to iptables\""
+                        print "\t\t\tfirewall_backend=\"iptables\""
+                        print "\t\t\t;;"
+                    }
                     print "\tesac"
-                    print "\tif [ \"${firewall_backend}\" = \"nftables\" ]; then"
-                    print "\t\tverify_nftables_prerequisites \"${data_root}\" || return 1"
-                    print "\tfi"
+                    if (def == "nftables") {
+                        print "\tif [ \"${firewall_backend}\" = \"nftables\" ]; then"
+                        print "\t\tverify_nftables_prerequisites \"${data_root}\" || return 1"
+                        print "\tfi"
+                    }
                     print "\tconfig_get_bool iptables globals iptables \"1\""
                     print "\tconfig_get_bool ip6tables globals ip6tables \"0\""
                     next
@@ -546,8 +609,13 @@ _docker_stack_patch_process_config_nftables() {
         mv "$tmp_path" "$dockerd_init"
     fi
 
-    if ! grep -Fq 'json_add_string "firewall-backend" "${firewall_backend}"' "$dockerd_init"; then
-        sed -i '/^[[:space:]]*json_add_string "log-level" "${log_level}"$/a\	json_add_string "firewall-backend" "${firewall_backend}"' "$dockerd_init"
+    if [ "$firewall_backend_default" = "nftables" ]; then
+        if ! grep -Fq 'json_add_string "firewall-backend" "${firewall_backend}"' "$dockerd_init"; then
+            sed -i '/^[[:space:]]*json_add_string "log-level" "${log_level}"$/a\	json_add_string "firewall-backend" "${firewall_backend}"' "$dockerd_init"
+        fi
+    else
+        # dockerd 27.x 不认识 firewall-backend，残留该字段会让守护进程直接拒绝启动。
+        sed -i '/^[[:space:]]*json_add_string "firewall-backend" /d' "$dockerd_init"
     fi
 
     if ! grep -Fq 'BLOCKING_RULE_ERROR=0' "$dockerd_init"; then
@@ -827,24 +895,39 @@ _docker_stack_patch_append_nft_rule_helpers() {
 
 _docker_stack_ensure_nftables_init_support() {
     local dockerd_init="$1"
+    local firewall_backend_default="${2:-nftables}"
 
-    if _docker_stack_init_supports_nftables_backend "$dockerd_init"; then
+    if [ "$firewall_backend_default" = "nftables" ]; then
+        if _docker_stack_init_supports_nftables_backend "$dockerd_init"; then
+            _docker_stack_patch_iptables_dispatch "$dockerd_init" || return 1
+            return 0
+        fi
+    elif _docker_stack_init_supports_iptables_backend "$dockerd_init"; then
         _docker_stack_patch_iptables_dispatch "$dockerd_init" || return 1
         return 0
     fi
 
-    _docker_stack_warn "$dockerd_init 缺少 nftables backend 逻辑，正在执行原位补丁"
+    _docker_stack_warn "$dockerd_init 缺少 firewall backend 逻辑，正在执行原位补丁"
 
-    _docker_stack_patch_nft_prereq_block "$dockerd_init" || return 1
-    _docker_stack_patch_process_config_nftables "$dockerd_init" || return 1
+    if [ "$firewall_backend_default" = "nftables" ]; then
+        _docker_stack_patch_nft_prereq_block "$dockerd_init" || return 1
+    fi
+    _docker_stack_patch_process_config_nftables "$dockerd_init" "$firewall_backend_default" || return 1
     _docker_stack_patch_service_error_handling "$dockerd_init" || return 1
     _docker_stack_patch_iptables_dispatch "$dockerd_init" || return 1
     _docker_stack_patch_append_nft_rule_helpers "$dockerd_init" || return 1
 
-    _docker_stack_init_supports_nftables_backend "$dockerd_init" || {
-        echo "错误：补丁后 $dockerd_init 仍缺少 nftables backend 逻辑" >&2
-        return 1
-    }
+    if [ "$firewall_backend_default" = "nftables" ]; then
+        _docker_stack_init_supports_nftables_backend "$dockerd_init" || {
+            echo "错误：补丁后 $dockerd_init 仍缺少 nftables backend 逻辑" >&2
+            return 1
+        }
+    else
+        _docker_stack_init_supports_iptables_backend "$dockerd_init" || {
+            echo "错误：补丁后 $dockerd_init 仍缺少 iptables backend 逻辑" >&2
+            return 1
+        }
+    fi
 }
 
 docker_stack_sync_nftables_compat() {
@@ -855,6 +938,7 @@ docker_stack_sync_nftables_compat() {
     local dockerd_config=""
     local dockerd_init=""
     local dockerd_sysctl=""
+    local firewall_backend_default="nftables"
 
     if [ "$#" -ge 3 ]; then
         storage_driver="$3"
@@ -896,14 +980,22 @@ docker_stack_sync_nftables_compat() {
         return 1
     }
 
+    # dockerd 27.x（moby < 28）没有 firewall-backend 选项，强行写入 daemon.json 会导致
+    # daemon 启动失败：the following directives don't match any configuration option。
+    # 这类树只能走 iptables（由 iptables-nft 提供，与 fw4 共存）。
+    if ! _docker_stack_dockerd_supports_firewall_backend "$dockerd_makefile"; then
+        firewall_backend_default="iptables"
+        _docker_stack_warn "dockerd $(_docker_stack_dockerd_major_version "$dockerd_makefile" 2>/dev/null || echo 未知) 不支持 firewall-backend（moby < 28），firewall backend 保持 iptables"
+    fi
+
     if [ "$dry_run" = "1" ]; then
         echo "[dry-run] dockerd Makefile DEPENDS will switch to nftables-default compatible set"
         echo "[dry-run] dockerd Makefile vendored-version checks will tolerate missing installer files"
         if _docker_stack_init_supports_nftables_backend "$dockerd_init"; then
-            echo "[dry-run] dockerd firewall_backend will be forced to nftables"
+            echo "[dry-run] dockerd firewall_backend will be forced to $firewall_backend_default"
         else
-            echo "[dry-run] dockerd.init lacks nftables backend support and will be patched in-place"
-            echo "[dry-run] dockerd firewall_backend will be forced to nftables after patch"
+            echo "[dry-run] dockerd.init lacks firewall backend support and will be patched in-place"
+            echo "[dry-run] dockerd firewall_backend will be forced to $firewall_backend_default after patch"
         fi
         if [ -n "$storage_driver" ]; then
             echo "[dry-run] dockerd storage_driver will be set to $storage_driver"
@@ -918,17 +1010,17 @@ docker_stack_sync_nftables_compat() {
     _docker_stack_update_dockerd_depends_block "$dockerd_makefile" || return 1
     _docker_stack_fix_dockerd_vendored_checks "$dockerd_makefile" || return 1
 
-    _docker_stack_ensure_nftables_init_support "$dockerd_init" || return 1
+    _docker_stack_ensure_nftables_init_support "$dockerd_init" "$firewall_backend_default" || return 1
     docker_stack_sync_dockerman_nftables_compat "$build_dir" "0" || return 1
 
-    _docker_stack_set_or_append_dockerd_uci_option "$dockerd_config" "firewall_backend" "nftables" || return 1
+    _docker_stack_set_or_append_dockerd_uci_option "$dockerd_config" "firewall_backend" "$firewall_backend_default" || return 1
     if [ -n "$storage_driver" ]; then
         _docker_stack_set_or_append_dockerd_uci_option "$dockerd_config" "storage_driver" "$storage_driver" || return 1
     else
         _docker_stack_remove_dockerd_uci_option "$dockerd_config" "storage_driver" || return 1
     fi
-    _docker_stack_fix_dockerd_nftables_comment "$dockerd_config"
-    echo "dockerd nftables 默认策略已应用。"
+    _docker_stack_fix_dockerd_nftables_comment "$dockerd_config" "$firewall_backend_default"
+    echo "dockerd firewall backend 已设置为 $firewall_backend_default。"
 
     _docker_stack_set_or_append_sysctl_value "$dockerd_sysctl" "net.ipv4.ip_forward" "1" || return 1
     _docker_stack_set_or_append_sysctl_value "$dockerd_sysctl" "net.ipv6.conf.all.forwarding" "1" || return 1
