@@ -99,11 +99,24 @@ fix_containerd_cpuid_linkname() {
     # /proc/self/auxv 回退分支（拿到的 HWCAP 值一致）。
     # 注意：该包自带的 build_dir 会在 configure 阶段被拷进 .go_work/build/src，
     # 所以钩子必须挂在 Prepare 之后、Configure 之前。
+    local containerd_mk="$BUILD_DIR/feeds/packages/utils/containerd/Makefile"
+    local containerd_major=""
     local pkg_dirs=(
         "$BUILD_DIR/feeds/packages/utils/containerd"
         "$BUILD_DIR/package/feeds/packages/containerd"
     )
     local dir
+
+    # containerd 2.x（pin_docker_stack_version 统一后的版本）已不再 vendor
+    # klauspost/cpuid，这个链接期修补没有作用对象，跳过。
+    if [ -f "$containerd_mk" ]; then
+        containerd_major=$(sed -n 's/^PKG_VERSION:=\([0-9][0-9.]*\).*/\1/p' "$containerd_mk" | head -n 1)
+        containerd_major="${containerd_major%%.*}"
+        if [ -n "$containerd_major" ] && [ "$containerd_major" -ge 2 ] 2>/dev/null; then
+            echo "containerd 已是 ${containerd_major}.x，无需 cpuid linkname 补丁。"
+            return 0
+        fi
+    fi
 
     for dir in "${pkg_dirs[@]}"; do
         [ -f "$dir/Makefile" ] || continue
@@ -183,6 +196,133 @@ SCRIPT
 
         echo "已为 containerd 打上 cpuid linkname 兼容补丁（Go 1.23+）：$dir/Makefile"
     done
+}
+
+
+pin_docker_stack_version() {
+    # openwrt-24.10 系列（含 padavanonly 的 mt798x 分支）的 feeds/packages 把
+    # dockerd 停在 27.x（moby < 28）。27.x 不认识 daemon.json 的 firewall-backend
+    # 选项，只能退回 iptables，与 master 树上的 29.x 行为不一致，docker.sh 因此
+    # 需要长期维护两套 backend 分支。这里把整条容器栈对齐到 immortalwrt/packages
+    # master 的包定义（dockerd/docker/containerd/runc），让所有设备统一走 nftables。
+    #
+    # 不能只改 dockerd 的版本号：27.x 的 Makefile 带着针对旧源码的补丁与
+    # hack/dockerfile/install 结构，且 Build/Prepare 会用 EnsureVendoredVersion
+    # 校验 containerd/runc/tini 的 PKG_VERSION 必须等于 moby Dockerfile 里的
+    # vendored 版本（29.6.1 -> containerd 2.2.5 / runc 1.3.6 / tini 0.19.0），
+    # 半新半旧的组合会直接中断构建。
+    #
+    # Go 侧不需要额外动作：update_golang 已把 golang 换成 sbwml 的 1.27.x，
+    # 高于 moby 29.6.1 要求的 go 1.25.9 与 containerd 2.2.5 要求的 go 1.25.0。
+    local target_version="${DOCKER_STACK_TARGET_VERSION:-29.6.1}"
+    local repo_url="${DOCKER_STACK_REPO_URL:-https://github.com/immortalwrt/packages.git}"
+    local repo_branch="${DOCKER_STACK_REPO_BRANCH:-master}"
+    local utils_dir="$BUILD_DIR/feeds/packages/utils"
+    local dockerd_mk="$utils_dir/dockerd/Makefile"
+    local components=("dockerd" "docker" "containerd" "runc")
+    local component
+    local current_version
+    local source_version
+    local cli_version
+    local grep_version='s/^PKG_VERSION:=\([0-9][0-9.]*\).*/\1/p'
+    local tmp_dir
+
+    # 未选 docker 的设备树里没有 dockerd，直接跳过（不联网）。
+    [ -f "$dockerd_mk" ] || return 0
+
+    current_version=$(sed -n "$grep_version" "$dockerd_mk" | head -n 1)
+    if [ -z "$current_version" ]; then
+        echo "警告：无法读取 $dockerd_mk 的 PKG_VERSION，跳过 docker 栈版本统一。" >&2
+        return 0
+    fi
+
+    if [ "$current_version" = "$target_version" ]; then
+        echo "dockerd 已是 $current_version，docker 栈无需统一。"
+        return 0
+    fi
+
+    echo "正在把 docker 栈从 dockerd $current_version 统一到 $target_version..."
+
+    tmp_dir=$(mktemp -d)
+    if ! git_retry clone --depth 1 --filter=blob:none --sparse -b "$repo_branch" "$repo_url" "$tmp_dir"; then
+        echo "错误：克隆 $repo_url（$repo_branch）失败，docker 栈版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    if ! git_retry -C "$tmp_dir" sparse-checkout set utils/dockerd utils/docker utils/containerd utils/runc; then
+        echo "错误：配置 $repo_url 的 docker 栈稀疏检出失败，版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    # 先整体校验、再一次性替换，避免留下半新半旧的容器栈。
+    for component in "${components[@]}"; do
+        if [ ! -f "$tmp_dir/utils/$component/Makefile" ]; then
+            echo "错误：$repo_url $repo_branch 缺少 utils/$component/Makefile，docker 栈版本统一中止。" >&2
+            \rm -rf "$tmp_dir"
+            exit 1
+        fi
+    done
+
+    if [ ! -f "$tmp_dir/utils/dockerd/files/dockerd.init" ]; then
+        echo "错误：$repo_url $repo_branch 的 dockerd 包缺少 files/dockerd.init，docker 栈版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    source_version=$(sed -n "$grep_version" "$tmp_dir/utils/dockerd/Makefile" | head -n 1)
+    if [ -z "$source_version" ]; then
+        echo "错误：无法读取 $repo_url $repo_branch 的 dockerd 版本，docker 栈版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    # 上游 master 若已前进到更高版本，按上游版本统一（仍然 >= 目标）；
+    # 若反而更旧，说明分支取错，不能拿它覆盖本地容器栈。
+    if [ "$(printf '%s\n%s\n' "$target_version" "$source_version" | sort -V | tail -n 1)" != "$source_version" ]; then
+        echo "错误：$repo_url $repo_branch 的 dockerd 为 $source_version，低于目标 $target_version，docker 栈版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    if [ "$source_version" != "$target_version" ]; then
+        echo "提示：$repo_url $repo_branch 当前 dockerd 为 $source_version（目标 $target_version），按上游版本统一。"
+    fi
+
+    # dockerd 的 Build/Prepare 要求 CLI 与 daemon 版本严格一致。
+    cli_version=$(sed -n "$grep_version" "$tmp_dir/utils/docker/Makefile" | head -n 1)
+    if [ "$cli_version" != "$source_version" ]; then
+        echo "错误：docker CLI $cli_version 与 dockerd $source_version 版本不一致，docker 栈版本统一中止。" >&2
+        \rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    for component in "${components[@]}"; do
+        \rm -rf "$utils_dir/$component"
+        mv "$tmp_dir/utils/$component" "$utils_dir/$component"
+    done
+    \rm -rf "$tmp_dir"
+
+    # 24.10 的 dockerd 27.x Config.in 会 select cgroupfs-mount，master 的 Config.in
+    # 去掉了这一项（新树按 cgroup v2 组织）。这里换的是版本、不是内核策略，
+    # 所以只要目标树里还有该包就把依赖补回，保持原有的 cgroup 挂载行为。
+    local dockerd_config_in="$utils_dir/dockerd/Config.in"
+    local cgroupfs_dir=""
+    for cgroupfs_dir in \
+        "$BUILD_DIR/package/utils/cgroupfs-mount" \
+        "$BUILD_DIR/feeds/packages/utils/cgroupfs-mount"; do
+        [ -d "$cgroupfs_dir" ] && break
+        cgroupfs_dir=""
+    done
+    if [ -f "$dockerd_config_in" ] && [ -n "$cgroupfs_dir" ] \
+        && ! grep -q "PACKAGE_cgroupfs-mount" "$dockerd_config_in" \
+        && grep -q "^	select KERNEL_CGROUP_NET_PRIO$" "$dockerd_config_in"; then
+        sed -i '/^	select KERNEL_CGROUP_NET_PRIO$/a\	select PACKAGE_cgroupfs-mount' "$dockerd_config_in"
+        echo "已在新 dockerd Config.in 中补回 cgroupfs-mount 依赖。"
+    fi
+
+    echo "docker 栈已统一：dockerd/docker $source_version，containerd $(sed -n "$grep_version" "$utils_dir/containerd/Makefile" | head -n 1)，runc $(sed -n "$grep_version" "$utils_dir/runc/Makefile" | head -n 1)。"
 }
 
 
