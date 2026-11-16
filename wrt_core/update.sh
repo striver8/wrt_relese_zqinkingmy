@@ -112,6 +112,9 @@ stage_pre_install_source_fixes() {
     update_nginx_ubus_module
     check_default_settings
     check_core_libffi
+    # 容器栈版本统一必须在 cpuid 补丁之前：cpuid 补丁改的是 containerd 的 Makefile，
+    # 之后被整包替换就会丢失。
+    pin_docker_stack_version
     fix_libxcrypt_werror
     fix_containerd_cpuid_linkname
     install_opkg_distfeeds
