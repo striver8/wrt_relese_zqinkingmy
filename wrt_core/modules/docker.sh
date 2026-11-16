@@ -187,6 +187,14 @@ _docker_stack_fix_dockerd_vendored_checks() {
     local mk_path="$1"
     local tmp_path=""
 
+    # moby 28+ 的 Makefile 直接比对 ../<dep>/Makefile 与 $(PKG_BUILD_DIR)/Dockerfile，
+    # 不再依赖 hack/dockerfile/install/*.installer 文件，也就没有「源码包里缺少
+    # installer 导致 Prepare 失败」的问题，无需补丁。
+    if grep -Fq '$(call EnsureVendoredVersion,containerd)' "$mk_path" \
+        && ! grep -Fq 'containerd.installer' "$mk_path"; then
+        return 0
+    fi
+
     tmp_path=$(mktemp) || {
         echo "错误：创建临时文件失败" >&2
         return 1
@@ -236,7 +244,9 @@ _docker_stack_fix_dockerd_nftables_comment() {
                 -e "/^# naively translates iptables rules\. For the best compatibility replace the following dependencies:/c\# If you must use legacy behavior for compatibility, switch \`firewall_backend\` to \`iptables\`." \
                 -e "/^# \`firewall4\` -> \`firewall\`/d" \
                 -e "/^# \`iptables-nft\` -> \`iptables-legacy\`/d" \
+                -e "/^# \`iptables-nft\` -> \`iptables-zz-legacy\`/d" \
                 -e "/^# \`ip6tables-nft\` -> \`ip6tables-legacy\`/d" \
+                -e "/^# \`ip6tables-nft\` -> \`ip6tables-zz-legacy\`/d" \
                 "$config_path"
         else
             sed -i \
