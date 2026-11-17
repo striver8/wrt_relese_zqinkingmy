@@ -2,12 +2,14 @@
 # target、kernel 与 base system 源码修正。
 
 fix_default_set() {
-    # 替换默认主题依赖，并注入系统设置和目标平台通用补丁。
-    if [ -d "$BUILD_DIR/feeds/luci/themes/luci-theme-$THEME_SET" ]; then
-        find "$BUILD_DIR/feeds/luci/collections/" -type f -name "Makefile" -exec sed -i "s/luci-theme-bootstrap/luci-theme-$THEME_SET/g" {} \;
-    else
-        echo "警告：luci-theme-$THEME_SET 不在 feed 中，保留 luci-theme-bootstrap 作为兜底主题。" >&2
-    fi
+    # 注入系统设置和目标平台通用补丁。
+    #
+    # 注意：集合依赖的替换不能放在这里。fix_default_set 运行在
+    # stage_pre_install_source_fixes 开头，此时 update_vantage() 还没有把
+    # luci-theme-$THEME_SET 克隆进 feeds/luci/themes，任何"目标主题是否存在"的
+    # 判断都会为假而被跳过，集合就永久停留在 luci-theme-bootstrap 上，
+    # THEME_SET 形同失效。替换改由 update_vantage() 收尾时调用
+    # fix_luci_theme_collection() 完成。
 
     # 兜底：每次开机校验 luci.main.mediaurlbase，避免 sysupgrade 保留配置后指向不存在的主题
     ensure_luci_theme_guard
@@ -20,6 +22,25 @@ fix_default_set() {
             \cp -f "$BASE_PATH/patches/tempinfo" "$BUILD_DIR/package/emortal/autocore/files/tempinfo"
         fi
     fi
+}
+
+
+fix_luci_theme_collection() {
+    # 把 luci 集合的默认主题依赖换成 $THEME_SET。
+    # 必须在 update_vantage() 把主题源码放进 feeds/luci/themes 之后调用，
+    # 否则目标主题目录还不存在，替换会被跳过（旧实现的实际行为）。
+    local collections_dir="$BUILD_DIR/feeds/luci/collections"
+
+    [ -d "$collections_dir" ] || return 0
+
+    if [ ! -d "$BUILD_DIR/feeds/luci/themes/luci-theme-$THEME_SET" ]; then
+        echo "警告：luci-theme-$THEME_SET 不在 feed 中，保留 luci-theme-bootstrap 作为兜底主题。" >&2
+        return 0
+    fi
+
+    find "$collections_dir" -type f -name "Makefile" \
+        -exec sed -i "s/luci-theme-bootstrap/luci-theme-$THEME_SET/g" {} \;
+    echo "已将 luci 集合的默认主题依赖替换为 luci-theme-$THEME_SET。"
 }
 
 

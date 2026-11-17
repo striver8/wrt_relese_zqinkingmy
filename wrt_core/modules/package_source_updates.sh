@@ -365,6 +365,10 @@ update_vantage() {
     mv "$tmp_dir/luci-app-vantage" "$dst_app_path"
     rm -rf "$tmp_dir"
 
+    # 主题源码此时才真正落在 feeds/luci/themes 下，集合依赖必须在这里替换。
+    # 放在 fix_default_set() 里会因为目录尚不存在而被跳过，THEME_SET 失效。
+    fix_luci_theme_collection
+
     echo "Vantage 主题和 dashboard 更新完成"
 }
 
